@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 data bucket.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: dmc
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Name prefix
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${Prefix}-data-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+Outputs:
+  BucketNameOut:
+    Description: Bucket name
+    Value: !Ref DataBucket
+  BucketArnOut:
+    Description: Bucket ARN
+    Value: !GetAtt DataBucket.Arn

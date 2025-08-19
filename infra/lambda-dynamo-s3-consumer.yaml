@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda consumer for SQS -> DynamoDB and S3 (unique names per stack).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: dmc
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Name prefix
+  QueueArn:
+    Type: String
+    Description: ARN of the SQS main queue
+  S3BucketName:
+    Type: String
+    Description: S3 bucket to store raw events
+  RetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: CloudWatch Logs retention days
+
+Resources:
+  FlightsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      # unique table name to avoid collisions with previous stacks
+      TableName: !Sub '${Prefix}-flights-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: flight_id
+          AttributeType: S
+        - AttributeName: flight_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: flight_id
+          KeyType: HASH
+        - AttributeName: flight_date
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl_epoch
+        Enabled: true
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # match default Lambda log group, but unique per stack
+      LogGroupName: !Sub '/aws/lambda/${Prefix}-sqs-consumer-${AWS::StackName}'
+      RetentionInDays: !Ref RetentionDays
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-sqs-consumer-role-${AWS::Region}-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SqsDdbS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !Ref QueueArn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt FlightsTable.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  SqsConsumer:
+    Type: AWS::Lambda::Function
+    Properties:
+      # unique function name -> unique default log group
+      FunctionName: !Sub '${Prefix}-sqs-consumer-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ConsumerRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FlightsTable
+          BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import os, json, uuid, boto3, datetime
+          ddb = boto3.client('dynamodb')
+          s3  = boto3.client('s3')
+          TABLE = os.environ['TABLE_NAME']
+          BUCKET = os.environ['BUCKET_NAME']
+
+          def handler(event, context):
+              inserted = 0
+              for record in event.get('Records', []):
+                  body = record.get('body') or "{}"
+                  try:
+                      item = json.loads(body)
+                  except Exception:
+                      item = {"raw": body}
+
+                  ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                  fid = str(item.get("id") or item.get("flight_number") or uuid.uuid4())
+                  fdate = str(item.get("fecha_vuelo") or ts.split("T")[0])
+                  ttl = int(datetime.datetime.utcnow().timestamp()) + 7*24*3600
+
+                  ddb.put_item(
+                      TableName=TABLE,
+                      Item={
+                          'flight_id': {'S': fid},
+                          'flight_date': {'S': fdate},
+                          'raw': {'S': json.dumps(item)},
+                          'ttl_epoch': {'N': str(ttl)}
+                      }
+                  )
+
+                  key = f"raw/api/{datetime.datetime.utcnow():%Y/%m/%d}/{uuid.uuid4()}.json"
+                  s3.put_object(Bucket=BUCKET, Key=key, Body=(json.dumps(item) + "\n").encode("utf-8"))
+                  inserted += 1
+
+              return {"inserted": inserted}
+
+  QueueToLambda:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref QueueArn
+      FunctionName: !Ref SqsConsumer
+      Enabled: true
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  DynamoTableOut:
+    Description: DynamoDB table name
+    Value: !Ref FlightsTable
+  ConsumerNameOut:
+    Description: Lambda consumer name
+    Value: !Ref SqsConsumer
+  LogGroupOut:
+    Description: CloudWatch Logs group
+    Value: !Ref ConsumerLogGroup

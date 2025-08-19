@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SQS main queue with DLQ.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: dmc
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Name prefix
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  Dlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-ingest-dlq'
+
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-ingest-queue'
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt Dlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+Outputs:
+  QueueUrlOut:
+    Description: Main queue URL
+    Value: !Ref MainQueue
+  QueueArnOut:
+    Description: Main queue ARN
+    Value: !GetAtt MainQueue.Arn
+  DlqUrlOut:
+    Description: DLQ URL
+    Value: !Ref Dlq
+  DlqArnOut:
+    Description: DLQ ARN
+    Value: !GetAtt Dlq.Arn
